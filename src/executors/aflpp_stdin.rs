@@ -1,12 +1,11 @@
 use {
     crate::Executor,
     libc::{
-        F_GETFD, F_SETFD, FD_CLOEXEC, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, close, dup2, fcntl, shmat,
-        shmget,
+        F_GETFD, F_SETFD, FD_CLOEXEC, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, c_void, close,
+        dup2, fcntl, shmat, shmctl, shmget,
     },
     nix::unistd::pipe,
     std::{
-        collections::HashSet,
         ffi::OsString,
         fs::{File, OpenOptions},
         io::{Read, Seek, SeekFrom, Write},
@@ -14,7 +13,7 @@ use {
             fd::AsRawFd,
             unix::process::{CommandExt, ExitStatusExt},
         },
-        process::{Command, ExitStatus, Stdio},
+        process::{Child, Command, ExitStatus, Stdio},
         ptr, slice,
     },
 };
@@ -27,13 +26,15 @@ fn read_pipe_word(mut pipe: &File) -> [u8; 4] {
 
 const AFL_HANDSHAKE_BYTES: [u8; 4] = *b"\x01LFA";
 
-pub struct AflppStdinExecutor<'a> {
+pub struct AflppStdinExecutor {
     stdin_file: File,
-    coverage_shmem: &'a mut [u8],
+    shmem_addr: *mut u8,
+    pub map_size: usize,
     read_pipe: File,
     write_pipe: File,
+    forkserver: Child,
 }
-impl AflppStdinExecutor<'_> {
+impl AflppStdinExecutor {
     #[must_use]
     pub fn new(path: &OsString, argv: &[OsString], stdin_filename: &str) -> Self {
         // this syscall sequence was ripped directly from running strace on afl-showmap
@@ -48,16 +49,27 @@ impl AflppStdinExecutor<'_> {
             .open(stdin_filename)
             .unwrap();
 
+        // Create a shmem
         let shmem_id = unsafe { shmget(IPC_PRIVATE, AFL_MAP_SIZE, IPC_CREAT | IPC_EXCL | 0o600) };
-        let shmem_addr = unsafe { shmat(shmem_id, ptr::null(), 0) };
+        assert!(shmem_id != -1);
 
+        // Map it into memory
+        let shmem_addr = unsafe { shmat(shmem_id, ptr::null(), 0) };
+        assert!(shmem_addr != usize::MAX as *mut c_void);
+
+        // Mark it to be destroyed when it's no longer mapped anywhere.
+        // Note that this has to happen after mapping the shmem, or else it will be immediately
+        // destroyed.
+        assert!(unsafe { shmctl(shmem_id, IPC_RMID, ptr::null_mut()) } == 0);
+
+        // These pipes are how we send and receive data from the forkserver.
         let (read_pipe, child_write_pipe) = pipe().unwrap();
         let (child_read_pipe, write_pipe) = pipe().unwrap();
 
         let mut forkserver = Command::new(path);
         forkserver
             .args(argv.iter())
-            .env("__AFL_SHM_ID", shmem_id.as_raw_fd().to_string())
+            .env("__AFL_SHM_ID", shmem_id.to_string())
             .env("AFL_MAP_SIZE", AFL_MAP_SIZE.to_string())
             .env("LD_BIND_NOW", "1")
             .stdin(Stdio::null())
@@ -65,27 +77,32 @@ impl AflppStdinExecutor<'_> {
             .stderr(Stdio::null());
 
         // This is outside the move closure so it isn't closed in the parent.
+        // We will be repeatedly seeking/writing to this fd, so we need to make sure it remains
+        // open.
         let stdin_file_fd = stdin_file.as_raw_fd();
         unsafe {
             forkserver.pre_exec(move || {
                 // dup the pipes into 198 and 199, which is where AFL++ expects them.
-                dup2(child_read_pipe.as_raw_fd(), 198);
-                dup2(child_write_pipe.as_raw_fd(), 199);
-                // The move on the closure will cause chlid_read_pipe and child_write_pipe to be
+                assert!(dup2(child_read_pipe.as_raw_fd(), 198) != -1);
+                assert!(dup2(child_write_pipe.as_raw_fd(), 199) != -1);
+                // The move on the closure will cause child_read_pipe and child_write_pipe to be
                 // closed in both the parent and the child, which is what we want.
+                // (The duped 198 and 199 remain open in the child)
 
                 // dupe the input file into stdin
-                dup2(stdin_file_fd, 0);
+                assert!(dup2(stdin_file_fd, 0) != -1);
                 close(stdin_file_fd);
 
                 // mark the new stdin so we don't lose it when we exec
-                fcntl(0, F_SETFD, fcntl(0, F_GETFD) & !FD_CLOEXEC);
+                let flags = fcntl(0, F_GETFD);
+                assert!(flags != -1);
+                assert!(fcntl(0, F_SETFD, flags & !FD_CLOEXEC) != -1);
 
                 Ok(())
             })
         };
         #[allow(clippy::zombie_processes)]
-        forkserver.spawn().expect("failed to start forkserver!");
+        let forkserver = forkserver.spawn().expect("failed to start forkserver!");
 
         let read_pipe = File::from(read_pipe);
 
@@ -99,9 +116,13 @@ impl AflppStdinExecutor<'_> {
             .write_all(&AFL_HANDSHAKE_BYTES.map(|x| 0xff - x))
             .unwrap();
 
-        let _flags = read_pipe_word(&read_pipe); // TODO: figure out what to do with this.
+        let flags = u32::from_ne_bytes(read_pipe_word(&read_pipe));
+        assert!(flags == 1, "unexpected flags. build with the latest afl++");
 
-        let map_size = read_pipe_word(&read_pipe);
+        let map_size: usize = u32::from_ne_bytes(read_pipe_word(&read_pipe))
+            .try_into()
+            .unwrap();
+        assert!(map_size < AFL_MAP_SIZE);
 
         assert!(
             read_pipe_word(&read_pipe) == AFL_HANDSHAKE_BYTES,
@@ -109,24 +130,22 @@ impl AflppStdinExecutor<'_> {
         );
 
         Self {
-            coverage_shmem: unsafe {
-                slice::from_raw_parts_mut(
-                    shmem_addr.cast(),
-                    u32::from_ne_bytes(map_size).try_into().unwrap(),
-                )
-            },
+            shmem_addr: shmem_addr.cast(),
+            map_size,
             read_pipe,
             write_pipe,
             stdin_file,
+            forkserver,
         }
     }
 }
 
-impl Executor for AflppStdinExecutor<'_> {
-    type Output = (ExitStatus, HashSet<usize>);
+impl Executor for AflppStdinExecutor {
+    type Output = (ExitStatus, &'static [u8]);
     type Input = Vec<u8>;
     fn run(&mut self, bytes_for_stdin: &Self::Input) -> Self::Output {
-        self.coverage_shmem.iter_mut().for_each(|x| *x = 0);
+        let shmem_addr = unsafe { slice::from_raw_parts_mut(self.shmem_addr, self.map_size) };
+        shmem_addr.fill(0);
 
         // write the bytes to stdin
         self.stdin_file.seek(SeekFrom::Start(0)).unwrap();
@@ -137,17 +156,16 @@ impl Executor for AflppStdinExecutor<'_> {
         self.stdin_file.seek(SeekFrom::Start(0)).unwrap();
 
         self.write_pipe.write_all(b"\x00\x00\x00\x00").unwrap(); // request to fork
-        let _some_kind_of_counter_increasing_by_twos = read_pipe_word(&self.read_pipe); // not sure what this is
+        let _pid = read_pipe_word(&self.read_pipe);
         let exit_status = ExitStatus::from_raw(i32::from_ne_bytes(read_pipe_word(&self.read_pipe)));
 
-        let coverage = self
-            .coverage_shmem
-            .iter()
-            .enumerate()
-            .filter(|&(_, &count)| count > 0)
-            .map(|(index, _)| index)
-            .collect();
+        (exit_status, shmem_addr)
+    }
+}
 
-        (exit_status, coverage)
+impl Drop for AflppStdinExecutor {
+    fn drop(&mut self) {
+        // Avoid creating a zombie process.
+        let _ = self.forkserver.wait();
     }
 }

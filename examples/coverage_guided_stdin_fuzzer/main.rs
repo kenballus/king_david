@@ -19,12 +19,15 @@ fn main() {
 
     let mut rng = SmallRng::seed_from_u64(4 /* obtained by rolling a fair die */);
 
+    let executor = AflppStdinExecutor::new(&args[0], args.as_slice(), "/tmp/.cur_input");
+    let map_size = executor.map_size;
+
     let mut fuzzer = Fuzzer::new(
         AndSplitDecider::new(WasTerminatedBySignal::default(), AlwaysResult::default()),
-        AflppStdinExecutor::new(&args[0], args.as_slice(), "/tmp/.cur_input"),
+        executor,
         AndSplitFeedback::new(
             AlwaysInterestingFeedback::default(),
-            EdgeCoverageFeedback::default(),
+            EdgeCoverageFeedback::new(map_size),
         ),
         ByteMutator::new(SmallRng::from_rng(&mut rng)),
         InMemoryCorpus::new(
