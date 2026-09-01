@@ -1,19 +1,20 @@
 use {
     crate::Executor,
     libc::{
-        F_GETFD, F_SETFD, FD_CLOEXEC, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, STDERR_FILENO,
-        STDIN_FILENO, STDOUT_FILENO, close, dup2, fcntl, shmat, shmctl, shmget,
+        F_GETFD, F_SETFD, FD_CLOEXEC, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, STDIN_FILENO,
+        STDOUT_FILENO, close, dup2, fcntl, shmat, shmctl, shmget,
     },
     nix::unistd::pipe,
     std::{
         ffi::OsString,
         fs::{File, OpenOptions},
         io::{Read, Seek, SeekFrom, Write},
+        marker::PhantomData,
         os::{
             fd::AsRawFd,
             unix::process::{CommandExt, ExitStatusExt},
         },
-        process::{Child, Command, ExitStatus},
+        process::{Child, Command, ExitStatus, Stdio},
         ptr, slice,
     },
 };
@@ -72,24 +73,43 @@ fn read_pipe_word(mut pipe: &File) -> [u8; 4] {
     result
 }
 
-pub struct AflppStdinExecutor {
+pub struct AflppStdinExecutor<O> {
     stdin_file: File,
     stdout_file: File,
-    stderr_file: File,
     shmem: AflSysVShmem,
     pub map_size: usize, // the size of the used portion of the shmem
     read_pipe: File,
     write_pipe: File,
     forkserver: Child,
+    phantom_data: PhantomData<O>,
 }
-impl AflppStdinExecutor {
+
+impl AflppStdinExecutor<(ExitStatus, &'static [u8])> {
+    #[must_use]
+    pub fn new_without_stdout(path: &OsString, argv: &[OsString], stdin_filename: &str) -> Self {
+        Self::new(path, argv, stdin_filename, None)
+    }
+}
+
+impl AflppStdinExecutor<(ExitStatus, &'static [u8], Vec<u8>)> {
+    #[must_use]
+    pub fn new_with_stdout(
+        path: &OsString,
+        argv: &[OsString],
+        stdin_filename: &str,
+        stdout_filename: &str,
+    ) -> Self {
+        Self::new(path, argv, stdin_filename, Some(stdout_filename))
+    }
+}
+
+impl<O> AflppStdinExecutor<O> {
     #[must_use]
     pub fn new(
         path: &OsString,
         argv: &[OsString],
         stdin_filename: &str,
         stdout_filename: Option<&str>,
-        stderr_filename: Option<&str>,
     ) -> Self {
         // this syscall sequence was ripped directly from running strace on afl-showmap
         // strace -ff afl-showmap -o /dev/null -- ./example_targets/manual_strcmp_afl/main
@@ -111,14 +131,6 @@ impl AflppStdinExecutor {
             .open(stdout_filename.unwrap_or("/dev/null"))
             .unwrap();
 
-        let stderr_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(stderr_filename.unwrap_or("/dev/null"))
-            .unwrap();
-
         // These pipes are how we send and receive data from the forkserver.
         let (read_pipe, child_write_pipe) = pipe().unwrap();
         let (child_read_pipe, write_pipe) = pipe().unwrap();
@@ -130,14 +142,14 @@ impl AflppStdinExecutor {
             .args(argv.iter())
             .env("__AFL_SHM_ID", shmem.id.to_string())
             .env("AFL_MAP_SIZE", shmem.size.to_string())
-            .env("LD_BIND_NOW", "1");
+            .env("LD_BIND_NOW", "1")
+            .stderr(Stdio::null());
 
         // This is outside the move closure so it isn't closed in the parent.
         // We will be repeatedly seeking/writing to this fd, so we need to make sure it remains
         // open.
         let stdin_file_fd = stdin_file.as_raw_fd();
         let stdout_file_fd = stdout_file.as_raw_fd();
-        let stderr_file_fd = stderr_file.as_raw_fd();
         unsafe {
             forkserver.pre_exec(move || {
                 // dup the pipes into 198 and 199, which is where AFL++ expects them.
@@ -153,9 +165,6 @@ impl AflppStdinExecutor {
 
                 assert!(dup2(stdout_file_fd, STDOUT_FILENO) != -1);
                 close(stdout_file_fd);
-
-                assert!(dup2(stderr_file_fd, STDERR_FILENO) != -1);
-                close(stderr_file_fd);
 
                 // mark the new stdin so we don't lose it when we exec
                 let flags = fcntl(0, F_GETFD);
@@ -197,12 +206,12 @@ impl AflppStdinExecutor {
         Self {
             stdin_file,
             stdout_file,
-            stderr_file,
             shmem,
             map_size,
             read_pipe,
             write_pipe,
             forkserver,
+            phantom_data: PhantomData::<O>,
         }
     }
 
@@ -213,14 +222,8 @@ impl AflppStdinExecutor {
     fn get_coverage_map_slice(&self) -> &'static [u8] {
         &self.shmem.as_slice()[..self.map_size]
     }
-}
 
-impl Executor for AflppStdinExecutor {
-    type Output = (ExitStatus, &'static [u8]);
-    type Input = Vec<u8>;
-    fn run(&mut self, bytes_for_stdin: &Self::Input) -> Self::Output {
-        self.get_coverage_map_mut_slice().fill(0);
-
+    fn prime_stdin(&mut self, bytes_for_stdin: &[u8]) {
         // write the bytes to stdin
         self.stdin_file.seek(SeekFrom::Start(0)).unwrap();
         self.stdin_file.write_all(bytes_for_stdin).unwrap();
@@ -228,16 +231,68 @@ impl Executor for AflppStdinExecutor {
             .set_len(bytes_for_stdin.len().try_into().unwrap())
             .unwrap();
         self.stdin_file.seek(SeekFrom::Start(0)).unwrap();
+    }
 
-        self.write_pipe.write_all(b"\x00\x00\x00\x00").unwrap(); // request to fork
-        let _pid = read_pipe_word(&self.read_pipe);
+    fn prime_stdout(&mut self) {
+        self.stdout_file.seek(SeekFrom::Start(0)).unwrap();
+        self.stdout_file.set_len(0).unwrap();
+    }
+
+    fn collect_stdout(&mut self) -> Vec<u8> {
+        let mut stdout = Vec::new();
+        self.stdout_file.read_to_end(&mut stdout).unwrap();
+
+        stdout
+    }
+
+    fn request_fork(&mut self) -> (u32, ExitStatus) {
+        self.write_pipe.write_all(b"\x00\x00\x00\x00").unwrap();
+
+        let pid = u32::from_ne_bytes(read_pipe_word(&self.read_pipe));
         let exit_status = ExitStatus::from_raw(i32::from_ne_bytes(read_pipe_word(&self.read_pipe)));
+
+        (pid, exit_status)
+    }
+
+    fn clear_coverage(&mut self) {
+        self.get_coverage_map_mut_slice().fill(0);
+    }
+}
+
+impl Executor for AflppStdinExecutor<(ExitStatus, &'static [u8])> {
+    type Output = (ExitStatus, &'static [u8]);
+    type Input = Vec<u8>;
+    fn run(&mut self, bytes_for_stdin: &Self::Input) -> Self::Output {
+        self.clear_coverage();
+
+        self.prime_stdin(bytes_for_stdin);
+
+        let (_pid, exit_status) = self.request_fork();
 
         (exit_status, self.get_coverage_map_slice())
     }
 }
 
-impl Drop for AflppStdinExecutor {
+impl Executor for AflppStdinExecutor<(ExitStatus, &'static [u8], Vec<u8>)> {
+    type Output = (ExitStatus, &'static [u8], Vec<u8>);
+    type Input = Vec<u8>;
+    fn run(&mut self, bytes_for_stdin: &Self::Input) -> Self::Output {
+        self.clear_coverage();
+
+        self.prime_stdin(bytes_for_stdin);
+        self.prime_stdout();
+
+        let (_pid, exit_status) = self.request_fork();
+
+        (
+            exit_status,
+            self.get_coverage_map_slice(),
+            self.collect_stdout(),
+        )
+    }
+}
+
+impl<O> Drop for AflppStdinExecutor<O> {
     fn drop(&mut self) {
         // Avoid creating a zombie process.
         self.forkserver.wait().unwrap();

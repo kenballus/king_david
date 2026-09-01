@@ -3,3 +3,6 @@ pub use black_box_stdin::*;
 
 mod aflpp_stdin;
 pub use aflpp_stdin::*;
+
+mod combinators;
+pub use combinators::*;
