@@ -21,7 +21,7 @@ pub trait Feedback {
 
 pub trait Logger {
     type Input;
-    fn log(&mut self, input: &Self::Input);
+    fn log(&mut self, input: &Self::Input, iterations: usize);
 }
 
 pub trait Mutator {
@@ -75,13 +75,15 @@ impl<
 > Fuzzer<D, E, F, M, C, L>
 {
     pub fn go(&mut self) {
+        let mut iterations = 0;
         loop {
             let input = self.mutator.mutate(self.corpus.select());
             let exec_output = self.executor.run(&input);
             let is_result = self.decider.is_result(&input, &exec_output);
             let is_interesting = self.feedback.update(exec_output);
+            iterations += 1;
             if is_result {
-                self.logger.log(&input);
+                self.logger.log(&input, iterations);
             } else if is_interesting {
                 self.corpus.add(input);
             }

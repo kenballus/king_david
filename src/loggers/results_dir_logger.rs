@@ -22,7 +22,7 @@ impl ResultsDirLogger {
 
 impl Logger for ResultsDirLogger {
     type Input = Vec<u8>;
-    fn log(&mut self, input: &Self::Input) {
+    fn log(&mut self, input: &Self::Input, _: usize) {
         let mut hasher = DefaultHasher::new();
         hasher.write(input);
         let result_filename = self.results_dir.join(hasher.finish().to_string());

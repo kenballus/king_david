@@ -1,5 +1,5 @@
 CC := clang
-CFLAGS := -std=c23
+CFLAGS := -std=c23 -O3
 
 .PHONY: all clean
 

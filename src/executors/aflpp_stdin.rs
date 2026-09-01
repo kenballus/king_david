@@ -1,8 +1,8 @@
 use {
     crate::Executor,
     libc::{
-        F_GETFD, F_SETFD, FD_CLOEXEC, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, close, dup2,
-        fcntl, shmat, shmctl, shmget,
+        F_GETFD, F_SETFD, FD_CLOEXEC, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, STDERR_FILENO,
+        STDIN_FILENO, STDOUT_FILENO, close, dup2, fcntl, shmat, shmctl, shmget,
     },
     nix::unistd::pipe,
     std::{
@@ -13,7 +13,7 @@ use {
             fd::AsRawFd,
             unix::process::{CommandExt, ExitStatusExt},
         },
-        process::{Child, Command, ExitStatus, Stdio},
+        process::{Child, Command, ExitStatus},
         ptr, slice,
     },
 };
@@ -74,6 +74,8 @@ fn read_pipe_word(mut pipe: &File) -> [u8; 4] {
 
 pub struct AflppStdinExecutor {
     stdin_file: File,
+    stdout_file: File,
+    stderr_file: File,
     shmem: AflSysVShmem,
     pub map_size: usize, // the size of the used portion of the shmem
     read_pipe: File,
@@ -82,7 +84,13 @@ pub struct AflppStdinExecutor {
 }
 impl AflppStdinExecutor {
     #[must_use]
-    pub fn new(path: &OsString, argv: &[OsString], stdin_filename: &str) -> Self {
+    pub fn new(
+        path: &OsString,
+        argv: &[OsString],
+        stdin_filename: &str,
+        stdout_filename: Option<&str>,
+        stderr_filename: Option<&str>,
+    ) -> Self {
         // this syscall sequence was ripped directly from running strace on afl-showmap
         // strace -ff afl-showmap -o /dev/null -- ./example_targets/manual_strcmp_afl/main
         const AFL_HANDSHAKE_BYTES: [u8; 4] = *b"\x01LFA";
@@ -93,6 +101,22 @@ impl AflppStdinExecutor {
             .create(true)
             .truncate(true)
             .open(stdin_filename)
+            .unwrap();
+
+        let stdout_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(stdout_filename.unwrap_or("/dev/null"))
+            .unwrap();
+
+        let stderr_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(stderr_filename.unwrap_or("/dev/null"))
             .unwrap();
 
         // These pipes are how we send and receive data from the forkserver.
@@ -106,15 +130,14 @@ impl AflppStdinExecutor {
             .args(argv.iter())
             .env("__AFL_SHM_ID", shmem.id.to_string())
             .env("AFL_MAP_SIZE", shmem.size.to_string())
-            .env("LD_BIND_NOW", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .env("LD_BIND_NOW", "1");
 
         // This is outside the move closure so it isn't closed in the parent.
         // We will be repeatedly seeking/writing to this fd, so we need to make sure it remains
         // open.
         let stdin_file_fd = stdin_file.as_raw_fd();
+        let stdout_file_fd = stdout_file.as_raw_fd();
+        let stderr_file_fd = stderr_file.as_raw_fd();
         unsafe {
             forkserver.pre_exec(move || {
                 // dup the pipes into 198 and 199, which is where AFL++ expects them.
@@ -125,8 +148,14 @@ impl AflppStdinExecutor {
                 // (The duped 198 and 199 remain open in the child)
 
                 // dupe the input file into stdin
-                assert!(dup2(stdin_file_fd, 0) != -1);
+                assert!(dup2(stdin_file_fd, STDIN_FILENO) != -1);
                 close(stdin_file_fd);
+
+                assert!(dup2(stdout_file_fd, STDOUT_FILENO) != -1);
+                close(stdout_file_fd);
+
+                assert!(dup2(stderr_file_fd, STDERR_FILENO) != -1);
+                close(stderr_file_fd);
 
                 // mark the new stdin so we don't lose it when we exec
                 let flags = fcntl(0, F_GETFD);
@@ -167,6 +196,8 @@ impl AflppStdinExecutor {
 
         Self {
             stdin_file,
+            stdout_file,
+            stderr_file,
             shmem,
             map_size,
             read_pipe,
@@ -175,11 +206,11 @@ impl AflppStdinExecutor {
         }
     }
 
-    fn get_shmem_mut_slice(&mut self) -> &'static mut [u8] {
+    fn get_coverage_map_mut_slice(&mut self) -> &'static mut [u8] {
         &mut self.shmem.as_mut_slice()[..self.map_size]
     }
 
-    fn get_shmem_slice(&self) -> &'static [u8] {
+    fn get_coverage_map_slice(&self) -> &'static [u8] {
         &self.shmem.as_slice()[..self.map_size]
     }
 }
@@ -188,7 +219,7 @@ impl Executor for AflppStdinExecutor {
     type Output = (ExitStatus, &'static [u8]);
     type Input = Vec<u8>;
     fn run(&mut self, bytes_for_stdin: &Self::Input) -> Self::Output {
-        self.get_shmem_mut_slice().fill(0);
+        self.get_coverage_map_mut_slice().fill(0);
 
         // write the bytes to stdin
         self.stdin_file.seek(SeekFrom::Start(0)).unwrap();
@@ -202,7 +233,7 @@ impl Executor for AflppStdinExecutor {
         let _pid = read_pipe_word(&self.read_pipe);
         let exit_status = ExitStatus::from_raw(i32::from_ne_bytes(read_pipe_word(&self.read_pipe)));
 
-        (exit_status, self.get_shmem_slice())
+        (exit_status, self.get_coverage_map_slice())
     }
 }
 

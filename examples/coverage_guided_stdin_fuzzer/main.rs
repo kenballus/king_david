@@ -16,10 +16,12 @@ fn main() {
     let mut args = args_os();
     let _ = args.next(); // skip argv[0]
     let args: Vec<_> = args.collect();
+    assert!(args.len() > 0, "Missing arg. Tell me what to exec!");
 
     let mut rng = SmallRng::seed_from_u64(4 /* obtained by rolling a fair die */);
 
-    let executor = AflppStdinExecutor::new(&args[0], args.as_slice(), "/tmp/.cur_input");
+    let executor =
+        AflppStdinExecutor::new(&args[0], args.as_slice(), "/tmp/.cur_input", None, None);
     let map_size = executor.map_size;
 
     let mut fuzzer = Fuzzer::new(

@@ -16,7 +16,7 @@ impl<T: Debug> Default for StdoutDebugLogger<T> {
 
 impl<T: Debug> Logger for StdoutDebugLogger<T> {
     type Input = T;
-    fn log(&mut self, input: &Self::Input) {
-        println!("Found result: {input:?}");
+    fn log(&mut self, input: &Self::Input, iterations: usize) {
+        println!("Found result after {iterations} iterations: {input:?}");
     }
 }
