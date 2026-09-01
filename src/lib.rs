@@ -5,8 +5,6 @@ pub mod feedbacks;
 pub mod loggers;
 pub mod mutators;
 
-use std::fmt::Debug;
-
 // Runs the program on the given input and produces an output
 pub trait Executor {
     type Input;
@@ -62,7 +60,7 @@ pub struct Fuzzer<
 }
 
 impl<
-    I: Debug,
+    I,
     O,
     D: Decider<ExecutionOutput = O, Input = I>,
     E: Executor<Input = I, Output = O>,
