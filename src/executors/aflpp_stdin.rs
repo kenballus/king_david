@@ -1,8 +1,8 @@
 use {
     crate::Executor,
     libc::{
-        F_GETFD, F_SETFD, FD_CLOEXEC, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, c_void, close,
-        dup2, fcntl, shmat, shmctl, shmget,
+        F_GETFD, F_SETFD, FD_CLOEXEC, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, close, dup2,
+        fcntl, shmat, shmctl, shmget,
     },
     nix::unistd::pipe,
     std::{
@@ -18,18 +18,64 @@ use {
     },
 };
 
+// Represents an AFL shmem. Note that only a prefix of this shmem will be used for the coverage map.
+// This object represents an entire shmem, so you should be slicing the result of .as_slice() if you
+// want just the coverage map, and not the crap that comes after.
+const AFL_MAP_SIZE: usize = 8_388_608;
+struct AflSysVShmem {
+    id: i32,
+    addr: *mut u8,
+    size: usize,
+}
+
+impl AflSysVShmem {
+    fn as_slice(&self) -> &'static [u8] {
+        unsafe { slice::from_raw_parts(self.addr.cast(), self.size) }
+    }
+
+    fn as_mut_slice(&mut self) -> &'static mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.addr.cast(), self.size) }
+    }
+}
+
+// There is no Drop impl for AflSysVShmem because that would mean the lifetime shouldn't be static.
+// I want it to be that any time you make one of these, it lives until the end of the process. This
+// makes it super easy to reason about lifetimes. I really tried to make this work, but it required
+// cluttering my traits enough that I think this is the best option.
+
+impl Default for AflSysVShmem {
+    fn default() -> Self {
+        // Create a shmem
+        let id = unsafe { shmget(IPC_PRIVATE, AFL_MAP_SIZE, IPC_CREAT | IPC_EXCL | 0o600) };
+        assert!(id != -1);
+
+        // Map it into memory
+        let addr = unsafe { shmat(id, ptr::null(), 0) }.cast();
+        assert!(addr != usize::MAX as *mut u8);
+
+        // Mark it to be destroyed when it's no longer mapped anywhere.
+        // Note that this has to happen after mapping the shmem, or else it will be immediately
+        // destroyed.
+        assert!(unsafe { shmctl(id, IPC_RMID, ptr::null_mut()) } == 0);
+
+        Self {
+            id,
+            addr,
+            size: AFL_MAP_SIZE,
+        }
+    }
+}
+
 fn read_pipe_word(mut pipe: &File) -> [u8; 4] {
     let mut result = [0; 4];
     pipe.read_exact(&mut result).unwrap();
     result
 }
 
-const AFL_HANDSHAKE_BYTES: [u8; 4] = *b"\x01LFA";
-
 pub struct AflppStdinExecutor {
     stdin_file: File,
-    shmem_addr: *mut u8,
-    pub map_size: usize,
+    shmem: AflSysVShmem,
+    pub map_size: usize, // the size of the used portion of the shmem
     read_pipe: File,
     write_pipe: File,
     forkserver: Child,
@@ -39,7 +85,7 @@ impl AflppStdinExecutor {
     pub fn new(path: &OsString, argv: &[OsString], stdin_filename: &str) -> Self {
         // this syscall sequence was ripped directly from running strace on afl-showmap
         // strace -ff afl-showmap -o /dev/null -- ./example_targets/manual_strcmp_afl/main
-        const AFL_MAP_SIZE: usize = 8_388_608;
+        const AFL_HANDSHAKE_BYTES: [u8; 4] = *b"\x01LFA";
 
         let stdin_file = OpenOptions::new()
             .read(true)
@@ -49,28 +95,17 @@ impl AflppStdinExecutor {
             .open(stdin_filename)
             .unwrap();
 
-        // Create a shmem
-        let shmem_id = unsafe { shmget(IPC_PRIVATE, AFL_MAP_SIZE, IPC_CREAT | IPC_EXCL | 0o600) };
-        assert!(shmem_id != -1);
-
-        // Map it into memory
-        let shmem_addr = unsafe { shmat(shmem_id, ptr::null(), 0) };
-        assert!(shmem_addr != usize::MAX as *mut c_void);
-
-        // Mark it to be destroyed when it's no longer mapped anywhere.
-        // Note that this has to happen after mapping the shmem, or else it will be immediately
-        // destroyed.
-        assert!(unsafe { shmctl(shmem_id, IPC_RMID, ptr::null_mut()) } == 0);
-
         // These pipes are how we send and receive data from the forkserver.
         let (read_pipe, child_write_pipe) = pipe().unwrap();
         let (child_read_pipe, write_pipe) = pipe().unwrap();
 
+        let shmem = AflSysVShmem::default();
+
         let mut forkserver = Command::new(path);
         forkserver
             .args(argv.iter())
-            .env("__AFL_SHM_ID", shmem_id.to_string())
-            .env("AFL_MAP_SIZE", AFL_MAP_SIZE.to_string())
+            .env("__AFL_SHM_ID", shmem.id.to_string())
+            .env("AFL_MAP_SIZE", shmem.size.to_string())
             .env("LD_BIND_NOW", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -101,7 +136,6 @@ impl AflppStdinExecutor {
                 Ok(())
             })
         };
-        #[allow(clippy::zombie_processes)]
         let forkserver = forkserver.spawn().expect("failed to start forkserver!");
 
         let read_pipe = File::from(read_pipe);
@@ -116,27 +150,37 @@ impl AflppStdinExecutor {
             .write_all(&AFL_HANDSHAKE_BYTES.map(|x| 0xff - x))
             .unwrap();
 
-        let flags = u32::from_ne_bytes(read_pipe_word(&read_pipe));
-        assert!(flags == 1, "unexpected flags. build with the latest afl++");
+        assert!(
+            u32::from_ne_bytes(read_pipe_word(&read_pipe)) == 1,
+            "unexpected flags. build with the latest afl++"
+        );
 
         let map_size: usize = u32::from_ne_bytes(read_pipe_word(&read_pipe))
             .try_into()
             .unwrap();
-        assert!(map_size < AFL_MAP_SIZE);
+        assert!(map_size < shmem.size);
 
         assert!(
             read_pipe_word(&read_pipe) == AFL_HANDSHAKE_BYTES,
-            "AFL++ handshake initiator was weird"
+            "AFL++ handshake terminator was weird"
         );
 
         Self {
-            shmem_addr: shmem_addr.cast(),
+            stdin_file,
+            shmem,
             map_size,
             read_pipe,
             write_pipe,
-            stdin_file,
             forkserver,
         }
+    }
+
+    fn get_shmem_mut_slice(&mut self) -> &'static mut [u8] {
+        &mut self.shmem.as_mut_slice()[..self.map_size]
+    }
+
+    fn get_shmem_slice(&self) -> &'static [u8] {
+        &self.shmem.as_slice()[..self.map_size]
     }
 }
 
@@ -144,8 +188,7 @@ impl Executor for AflppStdinExecutor {
     type Output = (ExitStatus, &'static [u8]);
     type Input = Vec<u8>;
     fn run(&mut self, bytes_for_stdin: &Self::Input) -> Self::Output {
-        let shmem_addr = unsafe { slice::from_raw_parts_mut(self.shmem_addr, self.map_size) };
-        shmem_addr.fill(0);
+        self.get_shmem_mut_slice().fill(0);
 
         // write the bytes to stdin
         self.stdin_file.seek(SeekFrom::Start(0)).unwrap();
@@ -159,13 +202,13 @@ impl Executor for AflppStdinExecutor {
         let _pid = read_pipe_word(&self.read_pipe);
         let exit_status = ExitStatus::from_raw(i32::from_ne_bytes(read_pipe_word(&self.read_pipe)));
 
-        (exit_status, shmem_addr)
+        (exit_status, self.get_shmem_slice())
     }
 }
 
 impl Drop for AflppStdinExecutor {
     fn drop(&mut self) {
         // Avoid creating a zombie process.
-        let _ = self.forkserver.wait();
+        self.forkserver.wait().unwrap();
     }
 }
