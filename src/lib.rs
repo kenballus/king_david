@@ -41,22 +41,26 @@ pub trait Corpus {
     fn add(&mut self, input: Self::Input);
 }
 
-pub struct Fuzzer<
-    I,
-    O,
-    D: Decider<Input = I, ExecutionOutput = O>,
-    E: Executor<Input = I, Output = O>,
-    F: Feedback<ExecutionOutput = O>,
-    M: Mutator<Input = I>,
-    C: Corpus<Input = I>,
-    L: Logger<Input = I>,
-> {
+pub struct Fuzzer<D, E, F, M, C, L> {
     decider: D,
     executor: E,
     feedback: F,
     mutator: M,
     corpus: C,
     logger: L,
+}
+
+impl<D, E, F, M, C, L> Fuzzer<D, E, F, M, C, L> {
+    pub fn new(decider: D, executor: E, feedback: F, mutator: M, corpus: C, logger: L) -> Self {
+        Self {
+            decider,
+            executor,
+            feedback,
+            mutator,
+            corpus,
+            logger,
+        }
+    }
 }
 
 impl<
@@ -68,19 +72,8 @@ impl<
     M: Mutator<Input = I>,
     C: Corpus<Input = I>,
     L: Logger<Input = I>,
-> Fuzzer<I, O, D, E, F, M, C, L>
+> Fuzzer<D, E, F, M, C, L>
 {
-    pub fn new(decider: D, executor: E, feedback: F, mutator: M, corpus: C, logger: L) -> Self {
-        Self {
-            decider,
-            executor,
-            feedback,
-            mutator,
-            corpus,
-            logger,
-        }
-    }
-
     pub fn go(&mut self) {
         loop {
             let input = self.mutator.mutate(self.corpus.select());
